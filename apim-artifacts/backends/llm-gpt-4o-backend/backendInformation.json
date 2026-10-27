@@ -1,0 +1,7 @@
+{
+  "properties": {
+    "description": "GPT-4o model endpoint",
+    "url": "https://contoso-aoai-dev.openai.azure.com/openai",
+    "protocol": "http"
+  }
+}

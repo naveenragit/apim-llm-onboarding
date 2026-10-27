@@ -1,0 +1,9 @@
+# Approved developer access for the dev environment.
+# Merging a change to this file grants, suspends, or cancels access.
+grants:
+  - email: jane.doe@contoso.com
+    firstName: Jane
+    lastName: Doe
+    product: llm-gpt-4o-standard        # APIM product id from 02-create-product
+    # state: active                     # active (default) | suspended | cancelled
+    # entraObjectId: 00000000-0000-0000-0000-000000000000   # link to Entra ID sign-in

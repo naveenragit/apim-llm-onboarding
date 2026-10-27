@@ -1,0 +1,10 @@
+{
+  "properties": {
+    "displayName": "GPT-4o Standard",
+    "description": "GPT-4o chat completions with a per-subscription token allowance.",
+    "subscriptionRequired": true,
+    "approvalRequired": true,
+    "subscriptionsLimit": 1,
+    "state": "published"
+  }
+}

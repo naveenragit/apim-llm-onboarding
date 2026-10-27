@@ -1,0 +1,22 @@
+<policies>
+    <inbound>
+        <base />
+        <!-- Token allowance per subscription key, applied to every model in the product. -->
+        <llm-token-limit counter-key="@(context.Subscription.Id)"
+                         tokens-per-minute="10000"
+                         token-quota="5000000"
+                         token-quota-period="Monthly"
+                         estimate-prompt-tokens="false"
+                         remaining-tokens-header-name="x-ratelimit-remaining-tokens"
+                         remaining-quota-tokens-header-name="x-quota-remaining-tokens" />
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>

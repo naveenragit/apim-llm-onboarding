@@ -1,0 +1,58 @@
+name: apiops-publish
+
+# Reusable job: dry-run, then publish apim-artifacts/ to one environment.
+# Each GitHub environment provides:
+#   secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#   vars:    APIM_RESOURCE_GROUP, APIM_SERVICE_NAME
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      APIM_RESOURCE_GROUP: ${{ vars.APIM_RESOURCE_GROUP }}
+      APIM_SERVICE_NAME: ${{ vars.APIM_SERVICE_NAME }}
+      OVERRIDES: 03-publish/environments/configuration.${{ inputs.environment }}.yaml
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Preview changes
+        run: >
+          npx apiops publish --dry-run
+          --resource-group "$APIM_RESOURCE_GROUP"
+          --service-name "$APIM_SERVICE_NAME"
+          --source apim-artifacts
+          --overrides "$OVERRIDES"
+
+      - name: Publish
+        run: >
+          npx apiops publish
+          --resource-group "$APIM_RESOURCE_GROUP"
+          --service-name "$APIM_SERVICE_NAME"
+          --source apim-artifacts
+          --overrides "$OVERRIDES"

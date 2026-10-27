@@ -1,0 +1,11 @@
+{
+  "name": "apim-llm-onboarding",
+  "private": true,
+  "description": "Onboard LLMs into Azure API Management, package them as products, and grant developer access.",
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@azure-tools/apiops-cli": "1.0.5"
+  }
+}

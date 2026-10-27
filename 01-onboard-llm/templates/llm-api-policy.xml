@@ -1,0 +1,31 @@
+<policies>
+    <inbound>
+        <base />
+        <!-- Only the onboarded deployment is reachable through this API. -->
+        <choose>
+            <when condition="@(context.Request.MatchedParameters.GetValueOrDefault("deployment-id", "") != "__DEPLOYMENT__")">
+                <return-response>
+                    <set-status code="404" reason="Deployment not available" />
+                </return-response>
+            </when>
+        </choose>
+        <set-backend-service backend-id="__BACKEND_ID__" />
+        <!-- Callers authenticate with their APIM key; APIM authenticates to the model with its managed identity. -->
+        <set-header name="api-key" exists-action="delete" />
+        <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+        <llm-emit-token-metric namespace="llm-gateway">
+            <dimension name="API ID" />
+            <dimension name="Product ID" />
+            <dimension name="Subscription ID" />
+        </llm-emit-token-metric>
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>
