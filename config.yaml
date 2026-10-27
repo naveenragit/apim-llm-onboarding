@@ -1,0 +1,37 @@
+# Single source of truth for models, products, and developer access.
+# Run `python main.py --env <environment>` after changing this file.
+
+# Activity 1: model deployments exposed through API Management.
+models:
+  - name: gpt-4o                       # APIM name: lowercase letters, digits, hyphens -> API "llm-gpt-4o"
+    displayName: GPT-4o
+    description: Azure OpenAI GPT-4o chat completions.
+    deployment: gpt-4o                 # Deployment name on the Azure OpenAI / Foundry resource
+    endpoints:                         # Model resource endpoint per environment
+      dev: https://contoso-aoai-dev.openai.azure.com
+      prod: https://contoso-aoai-prod.openai.azure.com
+
+# Activity 2: products that bundle models with a token allowance.
+products:
+  - name: gpt-4o-standard              # Product id becomes "llm-gpt-4o-standard"
+    displayName: GPT-4o Standard
+    description: GPT-4o chat completions with a per-subscription token allowance.
+    models: [gpt-4o]                   # Model names from the models section
+    approvalRequired: true             # Portal requests need approval; the access step grants directly
+    subscriptionsLimit: 1              # Subscriptions per developer
+    visibleTo: [developers]            # APIM groups that can see the product in the developer portal
+    limits:                            # Per subscription, shared by its primary and secondary keys
+      tokensPerMinute: 10000
+      monthlyTokenQuota: 5000000
+
+# Activity 4: approved developer access per environment.
+# Removing an entry does NOT revoke access; set state: suspended or cancelled first.
+access:
+  dev:
+    - email: jane.doe@contoso.com
+      firstName: Jane
+      lastName: Doe
+      product: gpt-4o-standard         # Product name from the products section
+      # state: active                  # active (default) | suspended | cancelled
+      # entraObjectId: 00000000-0000-0000-0000-000000000000   # Link to Entra ID sign-in
+  prod: []
