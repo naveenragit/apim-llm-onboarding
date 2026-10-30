@@ -21,20 +21,25 @@ The sample does not create APIM instances or deploy the underlying models.
 
 ## Workflow overview
 
-Complete these four activities in order for the initial onboarding:
+Complete these five activities in order for the initial onboarding:
 
 1. **Onboard an LLM:** generate its API, backend, and routing policy.
 2. **Create a product:** associate onboarded APIs with a product and a token allowance.
 3. **Publish to APIM:** deploy the generated configuration with APIOps.
 4. **Grant developer access:** create developer-owned subscriptions to the published product.
+5. **Smoke test:** call each model once through the APIM gateway.
 
 ```mermaid
 flowchart LR
     A["1. Onboard LLM"] --> B["2. Create product"]
     B --> C["3. Publish to APIM"]
     C --> D["4. Grant developer access"]
-    D --> E["Developer calls the model"]
+    D --> E["5. Smoke test"]
+    E --> F["Developer calls the model"]
 ```
+
+The whole `config.yaml`, including developer grants, is validated before any activity runs,
+so an invalid entry stops the run before anything is published.
 
 Once the product is deployed, additional developers can be onboarded by running only
 Activity 4 (`--steps access`).
@@ -49,6 +54,7 @@ Activity 4 (`--steps access`).
 | [create_product.py](create_product.py) | Activity 2: products, API and group links, and token-limit policy |
 | [publish.py](publish.py) | Activity 3: `apiops publish`, always previewed with a dry run first |
 | [grant_access.py](grant_access.py) | Activity 4: APIM users, product subscriptions, optional Key Vault key delivery |
+| [smoke_test.py](smoke_test.py) | Activity 5: one chat completion per model through the gateway |
 | [.github/workflows/deploy.yml](.github/workflows/deploy.yml) | Validates pull requests and deploys merged changes to dev, then prod |
 
 Activities 1 and 2 write APIOps artifacts to `build/<env>/apim-artifacts/`. That folder is
@@ -167,7 +173,7 @@ If token metrics are not required, remove that element from `API_POLICY` in
 ## Run the activities
 
 Edit [config.yaml](config.yaml), then run [main.py](main.py) for one environment. With no
-`--steps`, it runs all four activities in order; any subset still runs in that order.
+`--steps`, it runs all five activities in order; any subset still runs in that order.
 
 ```bash
 # Generate artifacts only; no Azure calls
@@ -177,7 +183,7 @@ python main.py --env dev --steps onboard product
 python main.py --env dev --dry-run \
   --subscription-id <azure-subscription-id> --resource-group <apim-rg> --service-name <apim-name>
 
-# Apply all four activities
+# Apply all five activities
 python main.py --env dev \
   --subscription-id <azure-subscription-id> --resource-group <apim-rg> --service-name <apim-name>
 ```
@@ -223,13 +229,24 @@ does not verify that calls reach the model.
 Add approved developers under `access.<env>`, using the product name from `products`. The
 production access list is empty by default. For each grant, the step:
 
-1. Finds the APIM user by ID or email, or creates one. For a new user, `entraObjectId` can
+1. Finds the APIM user by email, or creates one with ID `<email-slug>-<hash>`. The hash keeps
+   IDs unique for emails that differ only in punctuation. For a new user, `entraObjectId` can
    associate the account with an Entra identity; it does not configure portal authentication.
 2. Creates a product-scoped subscription, or changes the existing subscription's state.
 3. If Key Vault delivery is configured, stores the newly activated subscription's primary key
    in the secret named `apim-<subscription>`.
 
-The product must already be published, so run Activity 3 first for a new product.
+If an existing subscription with the expected ID belongs to a different user or product, the
+grant fails rather than changing it. The product must already be published, so run Activity 3
+first for a new product. In a dry run, grants for a product that is not published yet are
+reported as pending instead of failing.
+
+### Activity 5: Smoke test
+
+Sends one short chat completion to each model through the gateway and fails unless every call
+returns HTTP 200. It uses APIM's built-in all-access subscription (`master`), so it verifies
+routing and the managed-identity connection to the model, not product token limits. Dry runs
+skip this step.
 
 ### Pipeline
 
@@ -237,8 +254,8 @@ The product must already be published, so run Activity 3 first for a new product
 
 | Event | Behavior |
 |---|---|
-| Pull request | Generates artifacts for dev and prod to validate `config.yaml`; no Azure calls |
-| Merge to `main` | Runs all four activities for dev, then prod |
+| Pull request | Validates `config.yaml` (models, products, grants) and generates artifacts for dev and prod; no Azure calls |
+| Merge to `main` | Runs all five activities for dev; prod runs only after every dev step, including the smoke test, passes |
 | Manual run | Same as a merge; defaults to dry-run mode |
 
 Production approval is enforced by the GitHub environment protection rules configured during setup.
@@ -313,5 +330,7 @@ run against the same instance for publishing and access creation, while the API 
 policies are unchanged.
 
 The GitHub workflows, developer portal sign-in, Key Vault delivery, and Application Insights
-token metrics have **not** been validated. Run the workflows in the client's dev environment
-before production use.
+token metrics have **not** been validated. The smoke test, up-front grant validation, hashed
+user and subscription IDs, ownership checks, and dry-run handling of unpublished products were
+added afterwards and have not yet been run against Azure. Run the workflows in the client's dev
+environment before production use.

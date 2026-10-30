@@ -27,20 +27,22 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
+      # Validates models, products, and developer grants for each environment; no Azure calls.
       - run: |
           .venv/bin/python main.py --env dev --steps onboard product
           .venv/bin/python main.py --env prod --steps onboard product
 
-  deploy:
-    name: Deploy to ${{ matrix.environment }}
+  # Publish, grant access, and smoke test dev; prod runs only if every dev step passes.
+  deploy-dev:
+    name: Deploy to dev
     needs: validate
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 1
-      matrix:
-        environment: [dev, prod]
-    environment: ${{ matrix.environment }}
+    environment: dev
+    # One writer per APIM instance; later runs wait instead of publishing concurrently.
+    concurrency:
+      group: apim-dev
+      cancel-in-progress: false
     env:
       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       APIM_RESOURCE_GROUP: ${{ vars.APIM_RESOURCE_GROUP }}
@@ -63,4 +65,36 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      - run: .venv/bin/python main.py --env ${{ matrix.environment }} $DRY_RUN_FLAG
+      - run: .venv/bin/python main.py --env dev $DRY_RUN_FLAG
+
+  deploy-prod:
+    name: Deploy to prod
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    environment: prod
+    concurrency:
+      group: apim-prod
+      cancel-in-progress: false
+    env:
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      APIM_RESOURCE_GROUP: ${{ vars.APIM_RESOURCE_GROUP }}
+      APIM_SERVICE_NAME: ${{ vars.APIM_SERVICE_NAME }}
+      ACCESS_KEY_VAULT_URL: ${{ vars.ACCESS_KEY_VAULT_URL }}
+      DRY_RUN_FLAG: ${{ inputs.dry-run && '--dry-run' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: python -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - run: .venv/bin/python main.py --env prod $DRY_RUN_FLAG

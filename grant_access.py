@@ -10,6 +10,7 @@ set its state to suspended or cancelled instead.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass
@@ -36,6 +37,11 @@ def slugify(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
 
 
+def arm_tail(resource_id: str | None) -> str:
+    """Returns '<type>/<name>' from an ARM ID, e.g. 'products/llm-gpt-4o-standard'."""
+    return "/".join((resource_id or "").rstrip("/").split("/")[-2:]).lower()
+
+
 @dataclass(frozen=True)
 class Grant:
     email: str
@@ -47,11 +53,12 @@ class Grant:
 
     @property
     def user_id(self) -> str:
-        return slugify(self.email)[:80]
+        # The hash keeps IDs unique when emails differ only in punctuation, e.g. a.b@ and a-b@.
+        return f"{slugify(self.email)[:60]}-{hashlib.sha256(self.email.encode()).hexdigest()[:6]}"
 
     @property
     def subscription_id(self) -> str:
-        return f"{self.product}--{slugify(self.email)}"[:256]
+        return f"{self.product}--{self.user_id}"
 
     @property
     def display_name(self) -> str:
@@ -59,7 +66,7 @@ class Grant:
 
     @property
     def key_secret_name(self) -> str:
-        return f"apim-{self.subscription_id}"[:127]
+        return f"apim-{self.subscription_id}"
 
 
 def load_grants(config: dict, environment: str) -> list[Grant]:
@@ -114,27 +121,36 @@ class AccessProvisioner:
 
     def apply(self, grant: Grant) -> None:
         product_arm_id = self._product_arm_id(grant.product)
+        if product_arm_id is None:
+            log.info("[dry-run] would grant %s access to %s once the product is published", grant.email, grant.product)
+            return
         owner_arm_id = self._ensure_user(grant)
         activated = self._ensure_subscription(grant, owner_arm_id, product_arm_id)
         if activated and self._secrets:
             self._store_key(grant)
 
-    def _product_arm_id(self, product: str) -> str:
+    def _product_arm_id(self, product: str) -> str | None:
         if product not in self._product_ids:
             try:
                 self._product_ids[product] = self._client.product.get(*self._scope, product).id
             except ResourceNotFoundError:
+                # A dry run previews publish without creating the product, so it may not exist yet.
+                if self._dry_run:
+                    return None
                 raise ValueError(f"product '{product}' does not exist; publish it first") from None
         return self._product_ids[product]
 
     def _find_user(self, grant: Grant):
-        try:
-            return self._client.user.get(*self._scope, grant.user_id)
-        except ResourceNotFoundError:
-            pass
-        # Users who self-registered in the developer portal have generated ids.
+        # APIM allows one user per email, so email is the authoritative match (covers portal sign-ups).
         email_filter = "email eq '{}'".format(grant.email.replace("'", "''"))
-        return next(iter(self._client.user.list_by_service(*self._scope, filter=email_filter)), None)
+        for user in self._client.user.list_by_service(*self._scope, filter=email_filter):
+            if (user.email or "").lower() == grant.email:
+                return user
+        try:
+            user = self._client.user.get(*self._scope, grant.user_id)
+        except ResourceNotFoundError:
+            return None
+        raise ValueError(f"user id '{grant.user_id}' already belongs to {user.email}")
 
     def _ensure_user(self, grant: Grant) -> str | None:
         user = self._find_user(grant)
@@ -186,6 +202,12 @@ class AccessProvisioner:
             )
             log.info("Created %s subscription %s", grant.state, grant.subscription_id)
             return grant.state == "active"
+
+        if arm_tail(existing.owner_id) != arm_tail(owner_arm_id) or arm_tail(existing.scope) != arm_tail(product_arm_id):
+            raise ValueError(
+                f"subscription '{grant.subscription_id}' exists with owner '{existing.owner_id}' and scope "
+                f"'{existing.scope}', not {grant.email} on {grant.product}"
+            )
 
         if existing.state == grant.state:
             log.info("Subscription %s already %s", grant.subscription_id, grant.state)
