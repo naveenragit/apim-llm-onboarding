@@ -258,6 +258,11 @@ created on first use, so they go through the same product policies as developer 
 checks consume a few tokens of that subscription's allowance. Suspending the release-check
 subscription makes the smoke test fail. Dry runs skip this step.
 
+A newly created subscription key takes several seconds to reach the gateway, so the smoke test
+retries HTTP 401 for up to a minute. `subscriptionsLimit` also counts ownerless subscriptions:
+with a limit of 1, creating the release-check subscription fails if the product already has
+another ownerless subscription.
+
 ### Pipeline
 
 [.github/workflows/deploy.yml](.github/workflows/deploy.yml) runs the same `main.py`:
@@ -334,17 +339,12 @@ as a reference and update both `OPENAPI_SPEC` and `API_POLICY` in
 [onboard_model.py](onboard_model.py). Replacing the specification alone is not sufficient for
 operations with different routes.
 
-Activities 1-4 were run against a Developer-tier APIM instance with Azure OpenAI `gpt-4o` and
-`gpt-4.1` deployments. Validation covered the managed-identity role assignment, APIOps publishing,
-user and subscription creation, subscription key retrieval, successful model calls with
-token-limit headers, rejected calls to other deployments or without a key, and suspension and
-reactivation. Those runs used the earlier per-folder scripts; the refactored `main.py` was
-run against the same instance for publishing and access creation, while the API contract and
-policies are unchanged.
+The current code was run end to end against a Developer-tier APIM instance and an Azure OpenAI
+`gpt-4o` deployment on 2026-10-30; see [TEST_RESULTS.md](TEST_RESULTS.md) for each action and
+its outcome. Covered: dry runs, publishing, user and subscription creation, the product-scoped
+smoke test, header and query-string keys, deployment restriction, token-limit enforcement,
+adoption of portal-created subscriptions, and suspension, reactivation and cancellation.
 
-The GitHub workflows, developer portal sign-in, Key Vault delivery, and Application Insights
-token metrics have **not** been validated. The product-scoped smoke test, up-front grant
-validation, subscription lookup by owner, Key Vault reconciliation, query-string key removal,
-hashed user IDs, and the prod stale-commit check were added afterwards and have not yet been
-run against Azure or GitHub. Run the workflows in the client's dev environment before
-production use.
+The GitHub workflows (including the prod stale-commit check), developer portal sign-in,
+successful Key Vault delivery, and Application Insights token metrics have **not** been
+validated. Run the workflows in the client's dev environment before production use.

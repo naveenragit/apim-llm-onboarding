@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
 
@@ -22,6 +23,9 @@ log = logging.getLogger("smoke_test")
 
 API_VERSION = "2024-10-21"
 TOKEN_HEADERS = ("x-ratelimit-remaining-tokens", "x-quota-remaining-tokens")
+# A newly created subscription key took ~10s to reach the gateway in testing.
+KEY_PROPAGATION_RETRIES = 12
+KEY_PROPAGATION_DELAY = 5
 
 
 def release_check_key(client: ApiManagementClient, resource_group: str, service_name: str, product: str) -> str:
@@ -44,7 +48,15 @@ def release_check_key(client: ApiManagementClient, resource_group: str, service_
 
 
 def call_model(gateway: str, key: str, model: dict) -> str | None:
-    """Returns None on success, otherwise the reason for failure."""
+    """Returns None on success, otherwise the reason for failure. Retries 401 while a new key propagates."""
+    for attempt in range(KEY_PROPAGATION_RETRIES):
+        reason = _call_model_once(gateway, key, model)
+        if reason != "HTTP 401" or attempt == KEY_PROPAGATION_RETRIES - 1:
+            return reason
+        time.sleep(KEY_PROPAGATION_DELAY)
+
+
+def _call_model_once(gateway: str, key: str, model: dict) -> str | None:
     url = (
         f"{gateway}/llm/{model['name']}/openai/deployments/{model['deployment']}"
         f"/chat/completions?api-version={API_VERSION}"
