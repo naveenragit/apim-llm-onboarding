@@ -2,8 +2,8 @@
 
 For each grant under `access.<environment>` in config.yaml:
   * ensures the developer has an APIM user account
-  * ensures a product-scoped subscription exists in the requested state
-  * optionally stores the APIM-generated primary key in Azure Key Vault
+  * ensures the developer has one product subscription in the requested state, whatever its ID
+  * optionally keeps the active subscription's primary key current in Azure Key Vault
 
 Keys are never printed or written to Git. Removing a grant does not revoke access;
 set its state to suspended or cancelled instead.
@@ -125,9 +125,9 @@ class AccessProvisioner:
             log.info("[dry-run] would grant %s access to %s once the product is published", grant.email, grant.product)
             return
         owner_arm_id = self._ensure_user(grant)
-        activated = self._ensure_subscription(grant, owner_arm_id, product_arm_id)
-        if activated and self._secrets:
-            self._store_key(grant)
+        subscription = self._ensure_subscription(grant, owner_arm_id, product_arm_id)
+        if subscription and self._secrets and grant.state == "active":
+            self._deliver_key(grant, subscription)
 
     def _product_arm_id(self, product: str) -> str | None:
         if product not in self._product_ids:
@@ -178,17 +178,37 @@ class AccessProvisioner:
         log.info("Created user %s", grant.email)
         return user.id
 
-    def _ensure_subscription(self, grant: Grant, owner_arm_id: str | None, product_arm_id: str) -> bool:
-        """Returns True when the subscription was newly activated."""
-        try:
-            existing = self._client.subscription.get(*self._scope, grant.subscription_id)
-        except ResourceNotFoundError:
-            existing = None
+    def _find_subscription(self, product: str, owner_arm_id: str | None):
+        # Matches by owner rather than ID, so portal-requested subscriptions (random IDs) are found too.
+        if owner_arm_id is None:
+            return None
+        matches = [
+            subscription
+            for subscription in self._client.product_subscriptions.list(*self._scope, product)
+            if arm_tail(subscription.owner_id) == arm_tail(owner_arm_id)
+        ]
+        if len(matches) > 1:
+            names = ", ".join(subscription.name for subscription in matches)
+            raise ValueError(f"user has {len(matches)} subscriptions to {product} ({names}); remove the extras first")
+        return matches[0] if matches else None
+
+    def _ensure_subscription(self, grant: Grant, owner_arm_id: str | None, product_arm_id: str) -> str | None:
+        """Returns the name of the developer's subscription, or None if a dry run would create it."""
+        existing = self._find_subscription(grant.product, owner_arm_id)
 
         if existing is None:
+            try:
+                taken = self._client.subscription.get(*self._scope, grant.subscription_id)
+            except ResourceNotFoundError:
+                taken = None
+            if taken is not None:
+                raise ValueError(
+                    f"subscription id '{grant.subscription_id}' is already used by owner '{taken.owner_id}' "
+                    f"on '{taken.scope}'"
+                )
             if self._dry_run:
                 log.info("[dry-run] would create %s subscription %s", grant.state, grant.subscription_id)
-                return False
+                return None
             self._client.subscription.create_or_update(
                 *self._scope,
                 grant.subscription_id,
@@ -201,40 +221,44 @@ class AccessProvisioner:
                 notify=self._notify,
             )
             log.info("Created %s subscription %s", grant.state, grant.subscription_id)
-            return grant.state == "active"
-
-        if arm_tail(existing.owner_id) != arm_tail(owner_arm_id) or arm_tail(existing.scope) != arm_tail(product_arm_id):
-            raise ValueError(
-                f"subscription '{grant.subscription_id}' exists with owner '{existing.owner_id}' and scope "
-                f"'{existing.scope}', not {grant.email} on {grant.product}"
-            )
+            return grant.subscription_id
 
         if existing.state == grant.state:
-            log.info("Subscription %s already %s", grant.subscription_id, grant.state)
-            return False
+            log.info("Subscription %s already %s", existing.name, grant.state)
+            return existing.name
 
         if self._dry_run:
-            log.info("[dry-run] would change %s from %s to %s", grant.subscription_id, existing.state, grant.state)
-            return False
+            log.info("[dry-run] would change %s from %s to %s", existing.name, existing.state, grant.state)
+            return existing.name
         self._client.subscription.update(
             *self._scope,
-            grant.subscription_id,
+            existing.name,
             if_match="*",
             parameters=SubscriptionUpdateParameters(state=grant.state),
             notify=self._notify,
         )
-        log.info("Changed %s from %s to %s", grant.subscription_id, existing.state, grant.state)
-        return grant.state == "active"
+        log.info("Changed %s from %s to %s", existing.name, existing.state, grant.state)
+        return existing.name
 
-    def _store_key(self, grant: Grant) -> None:
-        keys = self._client.subscription.list_secrets(*self._scope, grant.subscription_id)
+    def _deliver_key(self, grant: Grant, subscription: str) -> None:
+        # Compares with the vault on every run, so a failed delivery is retried by an unchanged rerun.
+        key = self._client.subscription.list_secrets(*self._scope, subscription).primary_key
+        try:
+            delivered = self._secrets.get_secret(grant.key_secret_name).value
+        except ResourceNotFoundError:
+            delivered = None
+        if delivered == key:
+            return
+        if self._dry_run:
+            log.info("[dry-run] would store key for %s in Key Vault secret %s", subscription, grant.key_secret_name)
+            return
         self._secrets.set_secret(
             grant.key_secret_name,
-            keys.primary_key,
+            key,
             content_type="APIM subscription key",
-            tags={"apimSubscription": grant.subscription_id, "product": grant.product},
+            tags={"apimSubscription": subscription, "product": grant.product},
         )
-        log.info("Stored key for %s in Key Vault secret %s", grant.subscription_id, grant.key_secret_name)
+        log.info("Stored key for %s in Key Vault secret %s", subscription, grant.key_secret_name)
 
 
 def run(

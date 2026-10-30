@@ -33,6 +33,7 @@ API_POLICY = """<policies>
         <set-backend-service backend-id="__BACKEND_ID__" />
         <!-- Callers authenticate with their APIM key; APIM authenticates to the model with its managed identity. -->
         <set-header name="api-key" exists-action="delete" />
+        <set-query-parameter name="subscription-key" exists-action="delete" />
         <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
         <llm-emit-token-metric namespace="llm-gateway">
             <dimension name="API ID" />

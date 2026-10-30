@@ -2,10 +2,10 @@ name: Deploy LLM onboarding
 
 on:
   pull_request:
-    paths: ["*.py", config.yaml, requirements.txt, package.json, package-lock.json]
+    paths: ["*.py", config.yaml, requirements.txt, package.json, package-lock.json, .github/workflows/deploy.yml]
   push:
     branches: [main]
-    paths: ["*.py", config.yaml, requirements.txt, package.json, package-lock.json]
+    paths: ["*.py", config.yaml, requirements.txt, package.json, package-lock.json, .github/workflows/deploy.yml]
   workflow_dispatch:
     inputs:
       dry-run:
@@ -14,7 +14,6 @@ on:
         default: true
 
 permissions:
-  id-token: write
   contents: read
 
 jobs:
@@ -39,6 +38,9 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment: dev
+    permissions:
+      id-token: write
+      contents: read
     # One writer per APIM instance; later runs wait instead of publishing concurrently.
     concurrency:
       group: apim-dev
@@ -72,6 +74,9 @@ jobs:
     needs: deploy-dev
     runs-on: ubuntu-latest
     environment: prod
+    permissions:
+      id-token: write
+      contents: read
     concurrency:
       group: apim-prod
       cancel-in-progress: false
@@ -83,6 +88,14 @@ jobs:
       DRY_RUN_FLAG: ${{ inputs.dry-run && '--dry-run' || '' }}
     steps:
       - uses: actions/checkout@v4
+      # A run that waited for approval must not overwrite a newer release; roll back by reverting on main.
+      - name: Refuse superseded commits
+        run: |
+          latest=$(git ls-remote origin refs/heads/main | cut -f1)
+          if [ "$latest" != "$GITHUB_SHA" ]; then
+            echo "::error::$GITHUB_SHA is not the latest commit on main ($latest); not deploying to prod."
+            exit 1
+          fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"

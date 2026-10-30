@@ -58,7 +58,10 @@ Activity 4 (`--steps access`).
 | [.github/workflows/deploy.yml](.github/workflows/deploy.yml) | Validates pull requests and deploys merged changes to dev, then prod |
 
 Activities 1 and 2 write APIOps artifacts to `build/<env>/apim-artifacts/`. That folder is
-regenerated on every run and is not committed; `config.yaml` is the only file you edit.
+rebuilt by those two steps and is not committed; the publish step uses whatever they last
+generated, so run them together (the pipeline always does). `config.yaml` is the file you edit
+for models, products, and access; the API contract and policies live in
+[onboard_model.py](onboard_model.py) and [create_product.py](create_product.py).
 
 ## Prerequisites
 
@@ -158,8 +161,9 @@ Choose the delivery method before granting access:
   **Key Vault Secrets Officer** on the destination vault. Separately authorize the intended
   developer or application to read its secret; the script does not grant vault read permissions.
 
-The access script does not print key values or write them to Git. Key Vault delivery stores
-the primary key when a subscription is newly activated; it is not a continuous key-sync service.
+The access script does not print key values or write them to Git. On every access run, Key Vault
+delivery compares each active subscription's primary key with the vault copy and rewrites it if
+it is missing or out of date, so a failed delivery is retried by the next run. It does not rotate keys.
 
 ### 5. Configure token metrics
 
@@ -199,8 +203,9 @@ resource endpoint for each environment. For every model, this generates:
 
 - **Backend** `llm-<name>-backend`, pointing at `<endpoint>/openai` for the selected environment.
 - **API** `llm-<name>`, served at `https://<apim>.azure-api.net/llm/<name>/openai`.
-- **Policy** restricting requests to the configured deployment and authenticating to Azure
-  OpenAI with APIM's managed identity.
+- **Policy** restricting requests to the configured deployment, removing the caller's subscription
+  key (header and query string) before forwarding, and authenticating to Azure OpenAI with
+  APIM's managed identity.
 
 The API accepts the developer's APIM subscription key in the `api-key` header for compatibility
 with the Azure OpenAI client shown below. Model names allow only lowercase letters, digits, and
@@ -232,21 +237,26 @@ production access list is empty by default. For each grant, the step:
 1. Finds the APIM user by email, or creates one with ID `<email-slug>-<hash>`. The hash keeps
    IDs unique for emails that differ only in punctuation. For a new user, `entraObjectId` can
    associate the account with an Entra identity; it does not configure portal authentication.
-2. Creates a product-scoped subscription, or changes the existing subscription's state.
-3. If Key Vault delivery is configured, stores the newly activated subscription's primary key
-   in the secret named `apim-<subscription>`.
+2. Finds the developer's subscription to the product by owner, so subscriptions requested in the
+   developer portal are reused too. If none exists, creates one with ID
+   `llm-<product>--<user-id>`; otherwise changes the existing subscription's state if needed.
+3. If Key Vault delivery is configured and the grant is active, makes sure the secret
+   `apim-llm-<product>--<user-id>` holds the subscription's current primary key.
 
-If an existing subscription with the expected ID belongs to a different user or product, the
-grant fails rather than changing it. The product must already be published, so run Activity 3
-first for a new product. In a dry run, grants for a product that is not published yet are
-reported as pending instead of failing.
+If a developer has more than one subscription to the same product, or the new subscription ID
+is already used by someone else, the grant fails rather than guessing. The product must
+already be published, so run Activity 3 first for a new product. In a dry run, grants for a
+product that is not published yet are reported as pending instead of failing.
 
 ### Activity 5: Smoke test
 
-Sends one short chat completion to each model through the gateway and fails unless every call
-returns HTTP 200. It uses APIM's built-in all-access subscription (`master`), so it verifies
-routing and the managed-identity connection to the model, not product token limits. Dry runs
-skip this step.
+For each product, sends one short chat completion to each of its models through the gateway.
+Every call must return HTTP 200 with the `x-ratelimit-remaining-tokens` and
+`x-quota-remaining-tokens` headers, which proves the product's token policy ran. The calls use
+a dedicated release-check subscription per product (`llm-<product>--release-check`, no owner),
+created on first use, so they go through the same product policies as developer calls. The
+checks consume a few tokens of that subscription's allowance. Suspending the release-check
+subscription makes the smoke test fail. Dry runs skip this step.
 
 ### Pipeline
 
@@ -259,6 +269,9 @@ skip this step.
 | Manual run | Same as a merge; defaults to dry-run mode |
 
 Production approval is enforced by the GitHub environment protection rules configured during setup.
+After approval, the prod job refuses to deploy a commit that is no longer the latest on `main`,
+so a run that waited for approval cannot overwrite a newer release. To roll back, revert the
+change on `main` and let the pipeline deploy the revert.
 
 ## Call the model as a developer
 
@@ -305,13 +318,13 @@ secrets require a separate process.
 
 ### Update or retire models and products
 
-Change `config.yaml` and run `main.py` again; the artifacts are regenerated from scratch on
-every run. Removing a model or product from `config.yaml` does **not** delete it from APIM.
+Change `config.yaml` and run `main.py` again (or merge the change); the artifacts are rebuilt
+from `config.yaml`. Removing a model or product from `config.yaml` does **not** delete it from APIM.
 
-Treat retirement as a separate, reviewed change: delete the product (with its subscriptions),
-then the API, then the backend. Do not use `apiops publish --delete-unmatched` as routine
-cleanup: it can delete resources absent from this artifact tree, including developer
-subscriptions created by the access step.
+Treat retirement as a separate, reviewed change: delete the product (with its subscriptions,
+including the release-check subscription), then the API, then the backend. Do not use
+`apiops publish --delete-unmatched` as routine cleanup: it can delete resources absent from this
+artifact tree, including developer subscriptions created by the access step.
 
 ## Scope and validation
 
@@ -330,7 +343,8 @@ run against the same instance for publishing and access creation, while the API 
 policies are unchanged.
 
 The GitHub workflows, developer portal sign-in, Key Vault delivery, and Application Insights
-token metrics have **not** been validated. The smoke test, up-front grant validation, hashed
-user and subscription IDs, ownership checks, and dry-run handling of unpublished products were
-added afterwards and have not yet been run against Azure. Run the workflows in the client's dev
-environment before production use.
+token metrics have **not** been validated. The product-scoped smoke test, up-front grant
+validation, subscription lookup by owner, Key Vault reconciliation, query-string key removal,
+hashed user IDs, and the prod stale-commit check were added afterwards and have not yet been
+run against Azure or GitHub. Run the workflows in the client's dev environment before
+production use.
