@@ -143,7 +143,13 @@ permission to create role assignments. In PowerShell, assign the variables with
 Create a Microsoft Entra app registration with
 [federated credentials](https://github.com/Azure/apiops-cli/blob/main/docs/ci-cd/github-actions.md#oidc--federated-credentials)
 for the repository's `dev` and `prod` GitHub environments. Grant the pipeline identity
-**API Management Service Contributor** on the corresponding APIM instances.
+**API Management Service Contributor** on the corresponding APIM instances and **Reader** on
+their resource groups (the APIOps CLI reads the resource group before publishing).
+
+Use the subject GitHub actually presents. Some repositories present the classic form
+`repo:<owner>/<repo>:environment:<env>`; others, including newly created ones, present
+`repo:<owner>@<owner-id>/<repo>@<repo-id>:environment:<env>`. If `azure/login` fails with
+`AADSTS700213`, copy the subject from the error message into the federated credential.
 
 Create both GitHub environments and configure these values separately in each:
 
@@ -461,7 +467,8 @@ The Azure portal test console uses this subscription by default.
 **API Management Service Contributor** can also change networking, read named values, and
 delete the instance. Replace it with a custom role assigned on each APIM instance. Start from
 these actions; this list has not been validated, so run a dry run and add any action reported
-as denied:
+as denied. Keep **Reader** on the resource group (or a role with
+`Microsoft.Resources/subscriptions/resourceGroups/read`) for the APIOps CLI's preflight check:
 
 ```json
 [
