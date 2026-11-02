@@ -15,13 +15,15 @@ Examples:
   python main.py --env dev --steps access --dry-run   # preview access changes
 
 Azure settings come from flags or environment variables:
-  AZURE_SUBSCRIPTION_ID, APIM_RESOURCE_GROUP, APIM_SERVICE_NAME, ACCESS_KEY_VAULT_URL (optional)
+  AZURE_SUBSCRIPTION_ID, APIM_RESOURCE_GROUP, APIM_SERVICE_NAME, ALLOWED_MODEL_ENDPOINTS (required to publish),
+  ACCESS_KEY_VAULT_URL (optional), APIM_GATEWAY_URL (optional)
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +39,15 @@ import smoke_test
 REPO_ROOT = Path(__file__).resolve().parent
 STEPS = ("onboard", "product", "publish", "access", "smoke")
 AZURE_STEPS = {"publish", "access", "smoke"}
+# These values reach file paths and, on Windows, a cmd.exe command line, so they are validated strictly.
+ARGUMENT_PATTERNS = {
+    "env": re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$"),
+    "subscription_id": re.compile(r"^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$"),
+    "resource_group": re.compile(r"^[-\w.()]{0,89}[-\w()]$"),
+    "service_name": re.compile(r"^[a-zA-Z][a-zA-Z0-9-]{0,48}[a-zA-Z0-9]$"),
+    "key_vault_url": re.compile(r"^https://[a-z0-9-]{3,24}\.vault\.azure\.net/?$", re.IGNORECASE),
+    "gateway_url": re.compile(r"^https://[a-z0-9.-]+(:\d+)?/?$", re.IGNORECASE),
+}
 
 log = logging.getLogger("main")
 
@@ -50,7 +61,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--resource-group", default=os.environ.get("APIM_RESOURCE_GROUP"))
     parser.add_argument("--service-name", default=os.environ.get("APIM_SERVICE_NAME"))
     parser.add_argument("--key-vault-url", default=os.environ.get("ACCESS_KEY_VAULT_URL") or None,
-                        help="Optional Key Vault that receives each newly activated subscription key")
+                        help="Optional Key Vault that receives each active subscription key")
+    parser.add_argument("--allowed-endpoints", default=os.environ.get("ALLOWED_MODEL_ENDPOINTS") or None,
+                        help="Comma-separated model endpoints this environment may use; required to publish")
+    parser.add_argument("--gateway-url", default=os.environ.get("APIM_GATEWAY_URL") or None,
+                        help="Gateway base URL for the smoke test when it differs from the instance default")
     parser.add_argument("--notify", action="store_true", help="Let APIM email developers about access changes")
     parser.add_argument("--dry-run", action="store_true", help="Preview publish and access changes without applying them")
     args = parser.parse_args(argv)
@@ -59,13 +74,25 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         for option in ("subscription_id", "resource_group", "service_name"):
             if not getattr(args, option):
                 parser.error(f"--{option.replace('_', '-')} is required for publish/access/smoke (or set its environment variable)")
+    if "publish" in args.steps and not args.allowed_endpoints:
+        parser.error("--allowed-endpoints (or ALLOWED_MODEL_ENDPOINTS) is required to publish")
+    for option, pattern in ARGUMENT_PATTERNS.items():
+        value = getattr(args, option)
+        if value and not pattern.match(value):
+            parser.error(f"--{option.replace('_', '-')} has an invalid value")
     return args
 
 
-def validate_config(config: dict, environment: str) -> None:
+def allowed_endpoints(value: str | None) -> set[str] | None:
+    if not value:
+        return None
+    return {onboard_model.normalize_endpoint(item) for item in re.split(r"[,\s]+", value) if item}
+
+
+def validate_config(config: dict, environment: str, endpoints: set[str] | None = None) -> None:
     """Fails on any invalid model, product, or grant before Azure is touched."""
     models = config.get("models") or []
-    onboard_model.validate(models, environment)
+    onboard_model.validate(models, environment, endpoints)
     create_product.validate(config.get("products") or [], {model["name"] for model in models})
     grant_access.load_grants(config, environment)
 
@@ -80,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         config = yaml.safe_load(args.config.read_text(encoding="utf-8")) or {}
-        validate_config(config, args.env)
+        validate_config(config, args.env, allowed_endpoints(args.allowed_endpoints))
         if "onboard" in steps:
             onboard_model.run(config, args.env, artifacts)
         if "product" in steps:
@@ -129,7 +156,7 @@ def run_access(config: dict, args: argparse.Namespace) -> int:
 
 def run_smoke(config: dict, args: argparse.Namespace) -> None:
     _, client = api_client(args)
-    smoke_test.run(config, client, args.resource_group, args.service_name)
+    smoke_test.run(config, client, args.resource_group, args.service_name, args.gateway_url)
 
 
 if __name__ == "__main__":

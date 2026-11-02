@@ -18,22 +18,30 @@ log = logging.getLogger("onboard_model")
 PREFIX = "llm-"
 NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 DEPLOYMENT_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+# APIM sends its managed-identity token to this host, so only Azure AI resource endpoints are accepted.
+ENDPOINT_PATTERN = re.compile(
+    r"^https://[a-z0-9][a-z0-9-]{0,62}\.(openai\.azure\.com|cognitiveservices\.azure\.com|services\.ai\.azure\.com)$"
+)
 
 API_POLICY = """<policies>
     <inbound>
-        <base />
-        <!-- Only the onboarded deployment is reachable through this API. -->
+        <!-- URLs end up in logs, so the subscription key is accepted only in the api-key header. -->
         <choose>
+            <when condition="@(context.Request.Url.Query.ContainsKey("subscription-key"))">
+                <return-response>
+                    <set-status code="400" reason="Send the subscription key in the api-key header" />
+                </return-response>
+            </when>
             <when condition="@(context.Request.MatchedParameters.GetValueOrDefault("deployment-id", "") != "__DEPLOYMENT__")">
                 <return-response>
                     <set-status code="404" reason="Deployment not available" />
                 </return-response>
             </when>
         </choose>
+        <base />
         <set-backend-service backend-id="__BACKEND_ID__" />
         <!-- Callers authenticate with their APIM key; APIM authenticates to the model with its managed identity. -->
         <set-header name="api-key" exists-action="delete" />
-        <set-query-parameter name="subscription-key" exists-action="delete" />
         <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
         <llm-emit-token-metric namespace="llm-gateway">
             <dimension name="API ID" />
@@ -108,7 +116,12 @@ def backend_id(model_name: str) -> str:
     return f"{PREFIX}{model_name}-backend"
 
 
-def validate(models: list[dict], environment: str) -> None:
+def normalize_endpoint(endpoint: object) -> str:
+    return str(endpoint).strip().lower().rstrip("/")
+
+
+def validate(models: list[dict], environment: str, allowed_endpoints: set[str] | None = None) -> None:
+    """allowed_endpoints, when given, is the exact set of model endpoints this environment may use."""
     if not models:
         raise ValueError("config.yaml: no models defined")
     seen = set()
@@ -126,14 +139,18 @@ def validate(models: list[dict], environment: str) -> None:
         endpoint = model["endpoints"].get(environment)
         if not endpoint:
             raise ValueError(f"{where}: no endpoint for environment '{environment}'")
-        if not str(endpoint).startswith("https://"):
-            raise ValueError(f"{where}: endpoint for '{environment}' must use https")
+        if not ENDPOINT_PATTERN.match(normalize_endpoint(endpoint)):
+            raise ValueError(
+                f"{where}: endpoint for '{environment}' must be https://<resource>.openai.azure.com, "
+                ".cognitiveservices.azure.com or .services.ai.azure.com with no path"
+            )
+        if allowed_endpoints is not None and normalize_endpoint(endpoint) not in allowed_endpoints:
+            raise ValueError(f"{where}: endpoint {endpoint} is not in the allowed model endpoints for '{environment}'")
         seen.add(model["name"])
 
 
 def run(config: dict, environment: str, artifacts: Path) -> None:
     models = config.get("models") or []
-    validate(models, environment)
     for folder in ("apis", "backends"):
         shutil.rmtree(artifacts / folder, ignore_errors=True)
 
@@ -144,7 +161,7 @@ def run(config: dict, environment: str, artifacts: Path) -> None:
             {
                 "properties": {
                     "description": f"{model['displayName']} model endpoint",
-                    "url": model["endpoints"][environment].rstrip("/") + "/openai",
+                    "url": normalize_endpoint(model["endpoints"][environment]) + "/openai",
                     "protocol": "http",
                 }
             },

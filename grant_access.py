@@ -1,9 +1,11 @@
 """Activity 4: grant developers access to published products.
 
 For each grant under `access.<environment>` in config.yaml:
-  * ensures the developer has an APIM user account
+  * ensures the developer has an active APIM user account
   * ensures the developer has one product subscription in the requested state, whatever its ID
-  * optionally keeps the active subscription's primary key current in Azure Key Vault
+  * optionally keeps the active subscription's primary key current in Azure Key Vault, rotating it
+    before the secret expires
+Then reports product subscriptions that no grant manages.
 
 Keys are never printed or written to Git. Removing a grant does not revoke access;
 set its state to suspended or cancelled instead.
@@ -14,6 +16,7 @@ import hashlib
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
 from azure.keyvault.secrets import SecretClient
@@ -25,16 +28,23 @@ from azure.mgmt.apimanagement.models import (
     UserIdentityContract,
 )
 
-from create_product import product_id
+from create_product import product_id, release_check_id
 
 log = logging.getLogger("grant_access")
 
 VALID_STATES = ("active", "suspended", "cancelled")
+INACTIVE_SUBSCRIPTION_STATES = {"cancelled", "rejected", "expired"}
 EMAIL_PATTERN = re.compile(r"^[^@\s']+@[^@\s']+\.[^@\s']+$")
+KEY_LIFETIME = timedelta(days=90)
+ROTATE_BEFORE_EXPIRY = timedelta(days=14)
 
 
 def slugify(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+
+
+def key_fingerprint(key: str) -> str:
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
 def arm_tail(resource_id: str | None) -> str:
@@ -118,6 +128,7 @@ class AccessProvisioner:
         self._notify = notify
         self._dry_run = dry_run
         self._product_ids: dict[str, str] = {}
+        self._managed: set[tuple[str, str]] = set()
 
     def apply(self, grant: Grant) -> None:
         product_arm_id = self._product_arm_id(grant.product)
@@ -126,8 +137,30 @@ class AccessProvisioner:
             return
         owner_arm_id = self._ensure_user(grant)
         subscription = self._ensure_subscription(grant, owner_arm_id, product_arm_id)
+        if subscription:
+            self._managed.add((grant.product, subscription))
         if subscription and self._secrets and grant.state == "active":
             self._deliver_key(grant, subscription)
+
+    def report_unmanaged(self, product: str) -> int:
+        """Warns about live product subscriptions that no grant manages, e.g. approved in the portal."""
+        try:
+            subscriptions = list(self._client.product_subscriptions.list(*self._scope, product))
+        except ResourceNotFoundError:
+            return 0
+        unmanaged = [
+            subscription
+            for subscription in subscriptions
+            if subscription.name != release_check_id(product)
+            and (product, subscription.name) not in self._managed
+            and subscription.state not in INACTIVE_SUBSCRIPTION_STATES
+        ]
+        for subscription in unmanaged:
+            log.warning(
+                "%s: subscription %s (%s, owner %s) is not managed by config.yaml",
+                product, subscription.name, subscription.state, arm_tail(subscription.owner_id) or "none",
+            )
+        return len(unmanaged)
 
     def _product_arm_id(self, product: str) -> str | None:
         if product not in self._product_ids:
@@ -145,12 +178,23 @@ class AccessProvisioner:
         email_filter = "email eq '{}'".format(grant.email.replace("'", "''"))
         for user in self._client.user.list_by_service(*self._scope, filter=email_filter):
             if (user.email or "").lower() == grant.email:
+                if grant.state == "active":
+                    self._check_user(grant, user)
                 return user
         try:
             user = self._client.user.get(*self._scope, grant.user_id)
         except ResourceNotFoundError:
             return None
         raise ValueError(f"user id '{grant.user_id}' already belongs to {user.email}")
+
+    def _check_user(self, grant: Grant, user) -> None:
+        # Portal sign-ups can be unconfirmed or blocked; never hand an active key to those accounts.
+        if user.state != "active":
+            raise ValueError(f"APIM user {user.name} is {user.state}; resolve it in APIM before granting access")
+        if grant.entra_object_id:
+            identities = self._client.user.get(*self._scope, user.name).identities or []
+            if not any(i.provider == "aad" and i.id == grant.entra_object_id for i in identities):
+                raise ValueError(f"APIM user {user.name} is not linked to Entra object {grant.entra_object_id}")
 
     def _ensure_user(self, grant: Grant) -> str | None:
         user = self._find_user(grant)
@@ -241,24 +285,40 @@ class AccessProvisioner:
         return existing.name
 
     def _deliver_key(self, grant: Grant, subscription: str) -> None:
-        # Compares with the vault on every run, so a failed delivery is retried by an unchanged rerun.
+        # Runs every time, so a failed delivery or rotation is retried by an unchanged rerun.
         key = self._client.subscription.list_secrets(*self._scope, subscription).primary_key
-        try:
-            delivered = self._secrets.get_secret(grant.key_secret_name).value
-        except ResourceNotFoundError:
-            delivered = None
-        if delivered == key:
+        delivered = self._latest_secret_version(grant.key_secret_name)
+        now = datetime.now(timezone.utc)
+        current = delivered is not None and (delivered.tags or {}).get("keyFingerprint") == key_fingerprint(key)
+        expiring = delivered is not None and delivered.expires_on is not None and delivered.expires_on - now < ROTATE_BEFORE_EXPIRY
+        if current and not expiring:
             return
+        # Rotate only when the vault holds the live key; otherwise a rotated key is still awaiting delivery.
+        rotate = current and expiring
         if self._dry_run:
-            log.info("[dry-run] would store key for %s in Key Vault secret %s", subscription, grant.key_secret_name)
+            action = "rotate and store the key" if rotate else "store the key"
+            log.info("[dry-run] would %s for %s in Key Vault secret %s", action, subscription, grant.key_secret_name)
             return
+        if rotate:
+            self._client.subscription.regenerate_primary_key(*self._scope, subscription)
+            key = self._client.subscription.list_secrets(*self._scope, subscription).primary_key
+            log.info("Rotated the primary key of %s; the previous primary key no longer works", subscription)
         self._secrets.set_secret(
             grant.key_secret_name,
             key,
             content_type="APIM subscription key",
-            tags={"apimSubscription": subscription, "product": grant.product},
+            expires_on=now + KEY_LIFETIME,
+            tags={"apimSubscription": subscription, "product": grant.product, "keyFingerprint": key_fingerprint(key)},
         )
         log.info("Stored key for %s in Key Vault secret %s", subscription, grant.key_secret_name)
+
+    def _latest_secret_version(self, name: str):
+        # Reads properties only: an expired secret's value can't be read, but its metadata can.
+        try:
+            versions = list(self._secrets.list_properties_of_secret_versions(name))
+        except ResourceNotFoundError:
+            return None
+        return max(versions, key=lambda version: version.created_on, default=None)
 
 
 def run(
@@ -284,5 +344,14 @@ def run(
         except (ValueError, HttpResponseError) as error:
             failures += 1
             log.error("%s on %s: %s", grant.email, grant.product, error)
-    log.info("Processed %d grant(s) for %s, %d failed", len(grants), environment, failures)
+
+    unmanaged = 0
+    for product in config.get("products") or []:
+        try:
+            unmanaged += provisioner.report_unmanaged(product_id(product["name"]))
+        except HttpResponseError as error:
+            log.warning("could not check %s for unmanaged subscriptions: %s", product_id(product["name"]), error.message)
+    log.info(
+        "Processed %d grant(s) for %s, %d failed, %d unmanaged subscription(s)", len(grants), environment, failures, unmanaged
+    )
     return failures

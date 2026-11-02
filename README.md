@@ -89,8 +89,8 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -c "import sys; print(sys.prefix != sys.base_prefix, sys.version)"
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-npm ci
+python -m pip install --require-hashes -r requirements.txt
+npm ci --ignore-scripts
 ```
 
 **Linux or macOS Bash**
@@ -100,13 +100,17 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 python -c "import sys; print(sys.prefix != sys.base_prefix, sys.version)"
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-npm ci
+python -m pip install --require-hashes -r requirements.txt
+npm ci --ignore-scripts
 ```
 
 Before installing packages, confirm the interpreter check prints `True` and a Python 3.11
 version. On Windows ARM64, add `--only-binary=cryptography` to the requirements installation
 command if pip attempts a native build. Keep the environment active for the remaining Python commands.
+
+[requirements.txt](requirements.txt) pins every package, including transitive ones, with hashes.
+Edit the direct dependencies in [requirements.in](requirements.in) and regenerate the lock with
+the command at the top of that file.
 
 ### 2. Allow APIM to call the model
 
@@ -143,11 +147,22 @@ Create both GitHub environments and configure these values separately in each:
 | Secret | `AZURE_SUBSCRIPTION_ID` | Azure subscription containing the target APIM instance |
 | Variable | `APIM_RESOURCE_GROUP` | Target APIM resource group |
 | Variable | `APIM_SERVICE_NAME` | Target APIM instance name |
+| Variable | `ALLOWED_MODEL_ENDPOINTS` | Required. Comma-separated model endpoints this environment may route to, e.g. `https://contoso-aoai-dev.openai.azure.com` |
 | Variable | `ACCESS_KEY_VAULT_URL` | Optional vault URL for storing developer subscription keys |
+| Variable | `APIM_GATEWAY_URL` | Optional gateway base URL for the smoke test, e.g. a private hostname |
 
 Require pull request reviews on `main` and add required reviewers to the `prod` environment.
+Limit both environments' deployment branches to `main`, so a manual run from another branch
+cannot deploy. Add a CODEOWNERS rule so the platform team must approve changes to `config.yaml`,
+the Python files, and `.github/`. Keep `ALLOWED_MODEL_ENDPOINTS` in the GitHub environment rather
+than in `config.yaml`: APIM sends its managed-identity token to these endpoints, so a
+`config.yaml` change alone must not be able to add one.
+
 Both publishing and access provisioning use these environment settings; neither requires a
-client secret when federated authentication is configured.
+client secret when federated authentication is configured. The workflow sets
+`AZURE_TOKEN_CREDENTIALS=AzureCliCredential`, so the Python SDK and the APIOps CLI use only the
+OIDC sign-in, never a self-hosted runner's own managed identity. Actions are pinned to commit
+SHAs, installs are hash-locked, and [.github/dependabot.yml](.github/dependabot.yml) proposes updates.
 
 ### 4. Choose how developers retrieve keys
 
@@ -161,9 +176,14 @@ Choose the delivery method before granting access:
   **Key Vault Secrets Officer** on the destination vault. Separately authorize the intended
   developer or application to read its secret; the script does not grant vault read permissions.
 
-The access script does not print key values or write them to Git. On every access run, Key Vault
-delivery compares each active subscription's primary key with the vault copy and rewrites it if
-it is missing or out of date, so a failed delivery is retried by the next run. It does not rotate keys.
+The access script does not print key values or write them to Git. Each stored secret expires
+after 90 days and carries a `keyFingerprint` tag (a truncated SHA-256 of the key). On every
+access run, Key Vault delivery compares that fingerprint with the subscription's current primary
+key and rewrites the secret if it is missing or out of date, so a failed delivery is retried by
+the next run. Within 14 days of expiry, the run regenerates the subscription's primary key and
+stores the new one: the previous primary key stops working at once, so consumers must read the
+key from the vault rather than caching it. The access step needs to run at least every two weeks
+for this to happen before expiry.
 
 ### 5. Configure token metrics
 
@@ -185,39 +205,54 @@ python main.py --env dev --steps onboard product
 
 # Preview everything against Azure without changing it
 python main.py --env dev --dry-run \
-  --subscription-id <azure-subscription-id> --resource-group <apim-rg> --service-name <apim-name>
+  --subscription-id <azure-subscription-id> --resource-group <apim-rg> --service-name <apim-name> \
+  --allowed-endpoints https://<model-resource>.openai.azure.com
 
 # Apply all five activities
 python main.py --env dev \
-  --subscription-id <azure-subscription-id> --resource-group <apim-rg> --service-name <apim-name>
+  --subscription-id <azure-subscription-id> --resource-group <apim-rg> --service-name <apim-name> \
+  --allowed-endpoints https://<model-resource>.openai.azure.com
 ```
 
 The Azure settings can also come from `AZURE_SUBSCRIPTION_ID`, `APIM_RESOURCE_GROUP`,
-`APIM_SERVICE_NAME`, and optionally `ACCESS_KEY_VAULT_URL`. If those variables are set,
-`main.py` uses them automatically, so clear them before switching instances.
+`APIM_SERVICE_NAME`, `ALLOWED_MODEL_ENDPOINTS`, and optionally `ACCESS_KEY_VAULT_URL` and
+`APIM_GATEWAY_URL`. If those variables are set, `main.py` uses them automatically, so clear them
+before switching instances. Publishing refuses to run without the endpoint allow-list. The
+environment name and Azure identifiers are validated strictly before they are used.
 
 ### Activity 1: Onboard an LLM
 
 Add the model under `models` in `config.yaml`: the existing deployment name and the model
-resource endpoint for each environment. For every model, this generates:
+resource endpoint for each environment. Endpoints must be `https://<resource>.openai.azure.com`,
+`.cognitiveservices.azure.com` or `.services.ai.azure.com` with no path, and publishing also
+requires them to be in the environment's `ALLOWED_MODEL_ENDPOINTS`. For every model, this generates:
 
 - **Backend** `llm-<name>-backend`, pointing at `<endpoint>/openai` for the selected environment.
 - **API** `llm-<name>`, served at `https://<apim>.azure-api.net/llm/<name>/openai`.
-- **Policy** restricting requests to the configured deployment, removing the caller's subscription
-  key (header and query string) before forwarding, and authenticating to Azure OpenAI with
-  APIM's managed identity.
+- **Policy** rejecting requests to any other deployment (404) and requests that pass the key in
+  the query string (400), removing the caller's `api-key` header before forwarding, and
+  authenticating to Azure OpenAI with APIM's managed identity.
 
-The API accepts the developer's APIM subscription key in the `api-key` header for compatibility
-with the Azure OpenAI client shown below. Model names allow only lowercase letters, digits, and
-hyphens; for a deployment such as `gpt-4.1`, use a name like `gpt-4-1`.
+The API accepts the developer's APIM subscription key only in the `api-key` header, which the
+Azure OpenAI client shown below uses. Keys in URLs end up in logs, so query-string keys are
+rejected; if you add APIM diagnostics, also enable data masking for the `subscription-key`
+query parameter, because the rejected request is still logged. Model names allow only lowercase
+letters, digits, and hyphens; for a deployment such as `gpt-4.1`, use a name like `gpt-4-1`.
 
 ### Activity 2: Create a product
 
 Add the product under `products`, listing the model names to include, the visibility groups,
 and the token allowance. This generates product `llm-<name>`, its API and group links, and its
-token-limit policy. The product requires a subscription. By default, it is visible to the
-built-in `developers` group and portal subscription requests require approval. Any custom
-visibility groups must already exist in APIM.
+policy. The product requires a subscription, and portal subscription requests always require
+approval (`approvalRequired: false` is rejected), so access is granted through `config.yaml`.
+By default, the product is visible to the built-in `developers` group. Custom visibility groups
+must already exist in APIM; `guests` (anonymous portal visitors) is not allowed.
+
+The policy rejects any request whose `max_tokens` or `max_completion_tokens` exceeds
+`limits.maxTokensPerRequest` (400), then applies the token allowance with prompt-token
+estimation, so an exhausted allowance blocks requests before they reach the model. Because
+usage is only known after a response, a single request or concurrent requests can still
+exceed the per-minute limit by up to one request's size.
 
 The token allowance is **per subscription**, shared by its primary and secondary keys and
 the APIs in that product. Issue product-scoped subscriptions as in Activity 4: API-scoped or
@@ -237,11 +272,18 @@ production access list is empty by default. For each grant, the step:
 1. Finds the APIM user by email, or creates one with ID `<email-slug>-<hash>`. The hash keeps
    IDs unique for emails that differ only in punctuation. For a new user, `entraObjectId` can
    associate the account with an Entra identity; it does not configure portal authentication.
+   For an active grant, an existing user must be active (not an unconfirmed or blocked portal
+   sign-up) and, if `entraObjectId` is set, already linked to that Entra object.
 2. Finds the developer's subscription to the product by owner, so subscriptions requested in the
    developer portal are reused too. If none exists, creates one with ID
    `llm-<product>--<user-id>`; otherwise changes the existing subscription's state if needed.
 3. If Key Vault delivery is configured and the grant is active, makes sure the secret
-   `apim-llm-<product>--<user-id>` holds the subscription's current primary key.
+   `apim-llm-<product>--<user-id>` holds the subscription's current primary key, rotating it
+   before the secret expires (see [Choose how developers retrieve keys](#4-choose-how-developers-retrieve-keys)).
+
+After processing the grants, the step warns about every active, suspended, or pending product
+subscription that no grant manages, such as one approved directly in the portal. Add those
+developers to `config.yaml` or cancel the subscriptions.
 
 If a developer has more than one subscription to the same product, or the new subscription ID
 is already used by someone else, the grant fails rather than guessing. The product must
@@ -256,9 +298,13 @@ Every call must return HTTP 200 with the `x-ratelimit-remaining-tokens` and
 a dedicated release-check subscription per product (`llm-<product>--release-check`, no owner),
 created on first use, so they go through the same product policies as developer calls. The
 checks consume a few tokens of that subscription's allowance. Suspending the release-check
-subscription makes the smoke test fail. Dry runs skip this step.
+subscription makes the smoke test fail. Dry runs skip this step. After each run, the
+release-check primary key is regenerated, so it never becomes a standing credential.
 
-A newly created subscription key takes several seconds to reach the gateway, so the smoke test
+The smoke test calls the instance's default gateway hostname. Set `APIM_GATEWAY_URL` (or
+`--gateway-url`) when the runner must use another address, such as a private hostname.
+
+A new or regenerated subscription key takes several seconds to reach the gateway, so the smoke test
 retries HTTP 401 for up to a minute. `subscriptionsLimit` also counts ownerless subscriptions:
 with a limit of 1, creating the release-check subscription fails if the product already has
 another ownerless subscription.
@@ -318,8 +364,8 @@ Update the grant's `state` in `config.yaml` and run the access step
 | `cancelled` | Cancels the subscription and blocks calls |
 
 Removing a grant from `config.yaml` does **not** revoke an existing subscription. Apply the
-desired state before removing its record. Key rotation and removal of delivered Key Vault
-secrets require a separate process.
+desired state before removing its record. Removal of delivered Key Vault secrets requires a
+separate process.
 
 ### Update or retire models and products
 
@@ -345,6 +391,13 @@ its outcome. Covered: dry runs, publishing, user and subscription creation, the 
 smoke test, header and query-string keys, deployment restriction, token-limit enforcement,
 adoption of portal-created subscriptions, and suspension, reactivation and cancellation.
 
+The security hardening was then checked on 2026-11-02. Against the same instance: publishing
+with the endpoint allow-list and CLI-only credentials, the smoke test, query-string keys
+rejected (400), the `max_tokens` cap (at, over, non-integer, omitted, and null), release-check
+key regeneration, and the unmanaged-subscription warning. With mocks: endpoint, argument, and
+product validation; user state and Entra checks; and Key Vault fingerprinting, expiry, and rotation.
+
 The GitHub workflows (including the prod stale-commit check), developer portal sign-in,
-successful Key Vault delivery, and Application Insights token metrics have **not** been
-validated. Run the workflows in the client's dev environment before production use.
+successful Key Vault delivery and rotation against a real vault, and Application Insights token
+metrics have **not** been validated. Run the workflows in the client's dev environment before
+production use.

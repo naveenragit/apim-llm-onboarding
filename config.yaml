@@ -17,12 +17,13 @@ products:
     displayName: GPT-4o Standard
     description: GPT-4o chat completions with a per-subscription token allowance.
     models: [gpt-4o]                   # Model names from the models section
-    approvalRequired: true             # Portal requests need approval; the access step grants directly
+    approvalRequired: true             # Must stay true: portal requests need approval; the access step grants directly
     subscriptionsLimit: 1              # Subscriptions per developer
-    visibleTo: [developers]            # APIM groups that can see the product in the developer portal
+    visibleTo: [developers]            # APIM groups that can see the product in the developer portal (not guests)
     limits:                            # Per subscription, shared by its primary and secondary keys
       tokensPerMinute: 10000
       monthlyTokenQuota: 5000000
+      maxTokensPerRequest: 4096        # Largest max_tokens / max_completion_tokens a request may ask for
 
 # Activity 4: approved developer access per environment.
 # Removing an entry does NOT revoke access; set state: suspended or cancelled first.

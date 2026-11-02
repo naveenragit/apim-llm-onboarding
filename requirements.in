@@ -1,0 +1,6 @@
+# Direct dependencies. Regenerate the locked, hashed requirements.txt after changing this file:
+#   uv pip compile requirements.in --universal --python-version 3.11 --generate-hashes -o requirements.txt
+PyYAML==6.0.3
+azure-identity==1.27.0
+azure-mgmt-apimanagement==5.0.0
+azure-keyvault-secrets==4.11.3
