@@ -8,6 +8,11 @@ Everything is defined in one file, [config.yaml](config.yaml), reviewed in Git, 
 [APIOps CLI](https://github.com/Azure/apiops-cli); developer access is created with the APIM SDK.
 The sample does not create APIM instances or deploy the underlying models.
 
+> **Proof of concept.** The code controls the risks it owns (endpoint allow-list, header-only
+> keys, token limits, reviewed access grants), but a production deployment also needs the
+> network, identity, and GitHub configuration described in
+> [Production implementation](#production-implementation), which this sample does not create.
+
 ## Contents
 
 - [Workflow overview](#workflow-overview)
@@ -17,6 +22,7 @@ The sample does not create APIM instances or deploy the underlying models.
 - [Run the activities](#run-the-activities)
 - [Call the model as a developer](#call-the-model-as-a-developer)
 - [Ongoing operations](#ongoing-operations)
+- [Production implementation](#production-implementation)
 - [Scope and validation](#scope-and-validation)
 
 ## Workflow overview
@@ -377,6 +383,134 @@ including the release-check subscription), then the API, then the backend. Do no
 `apiops publish --delete-unmatched` as routine cleanup: it can delete resources absent from this
 artifact tree, including developer subscriptions created by the access step.
 
+## Production implementation
+
+The sample deploys configuration into resources you already own. Complete these steps for each
+environment, dev first, before granting production access.
+
+### 1. Choose an APIM tier and network model
+
+| Tier | Private inbound (callers to APIM) | Private outbound (APIM to model) | Notes |
+|---|---|---|---|
+| Premium v2 | Virtual network injection or private endpoint | Virtual network injection | Full isolation |
+| Premium (classic) | Internal virtual network or private endpoint | Virtual network injection | Full isolation |
+| Standard v2 | Private endpoint | Virtual network integration | Developer portal and management plane stay public |
+| Developer (classic) | Internal virtual network or private endpoint | Virtual network injection | No SLA; non-production only |
+| Basic, Standard (classic) | Private endpoint | None | The model endpoint must stay publicly reachable |
+| Basic v2, Consumption | None | None | Cannot be made private |
+
+After adding a private endpoint, set the instance's public network access to **Disabled**;
+otherwise subscription keys still work from the internet. If developers must never use a public
+endpoint and the developer portal stays public (Standard v2), deliver keys through Key Vault.
+See [Use a virtual network with API Management](https://learn.microsoft.com/azure/api-management/virtual-network-concepts).
+
+### 2. Lock down the model resources
+
+- Add a private endpoint for each model resource in the network APIM sends traffic from, and link
+  the matching private DNS zone (`privatelink.openai.azure.com`,
+  `privatelink.cognitiveservices.azure.com`, or `privatelink.services.ai.azure.com`) to it.
+- Set public network access to **Disabled** and disable local (API key) authentication; APIM
+  authenticates with Microsoft Entra ID.
+- Allow APIM's outbound traffic to the model private endpoints (443), to Microsoft Entra ID
+  (`AzureActiveDirectory` service tag, for managed-identity tokens), and to Azure Monitor if you
+  collect metrics. Check the tier's networking article for its other outbound dependencies.
+
+### 3. Give APIM a dedicated identity for the models
+
+The policy uses APIM's system-assigned identity, which every API on the instance can use. On a
+shared instance, create a user-assigned identity for these models only: attach it to APIM, grant
+it **Cognitive Services OpenAI User** on the model resources, add
+`client-id="<identity-client-id>"` to `authentication-managed-identity` in `API_POLICY`
+([onboard_model.py](onboard_model.py)), and remove the system-assigned identity's role.
+
+### 4. Suspend the built-in all-access subscription
+
+Every instance has an all-access subscription (`master`) that skips product policies, including
+the token limits. Suspend it unless administrators need it:
+
+```bash
+az rest --method patch --headers "If-Match=*" \
+  --url "https://management.azure.com/subscriptions/<azure-subscription-id>/resourceGroups/<apim-rg>/providers/Microsoft.ApiManagement/service/<apim-name>/subscriptions/master?api-version=2024-05-01" \
+  --body '{"properties":{"state":"suspended"}}'
+```
+
+The Azure portal test console uses this subscription by default.
+
+### 5. Narrow the pipeline identity's permissions
+
+**API Management Service Contributor** can also change networking, read named values, and
+delete the instance. Replace it with a custom role assigned on each APIM instance. Start from
+these actions; this list has not been validated, so run a dry run and add any action reported
+as denied:
+
+```json
+[
+  "Microsoft.ApiManagement/service/read",
+  "Microsoft.ApiManagement/service/apis/*",
+  "Microsoft.ApiManagement/service/backends/*",
+  "Microsoft.ApiManagement/service/products/*",
+  "Microsoft.ApiManagement/service/groups/read",
+  "Microsoft.ApiManagement/service/users/*",
+  "Microsoft.ApiManagement/service/subscriptions/*"
+]
+```
+
+The pipeline still needs to read subscription keys for the smoke test and Key Vault delivery.
+Give it **Key Vault Secrets Officer** only on a vault used for these keys, and give each consumer
+**Key Vault Secrets User** scoped to its own secret
+(`.../vaults/<vault>/secrets/apim-llm-<product>--<user-id>`).
+
+### 6. Protect the repository and environments
+
+- Limit the `dev` and `prod` environments' deployment branches to `main`.
+- Add required reviewers to `prod`, select **Prevent self-review**, and disallow administrator bypass.
+- Protect `main`: require pull request reviews and a CODEOWNERS rule covering `config.yaml`,
+  `*.py`, `requirements*`, `package*.json`, and `.github/`.
+- Check your GitHub plan: on GitHub Free, environments are available only in public
+  repositories, and some protection rules are limited for private repositories on other plans.
+
+### 7. Run the deploy jobs inside the network
+
+Publishing and access use Azure Resource Manager, which stays public, but the smoke test calls the
+gateway and Key Vault delivery calls the vault, so both need the private network. Change
+`runs-on` for `deploy-dev` and `deploy-prod` in
+[.github/workflows/deploy.yml](.github/workflows/deploy.yml) to runners that can reach it:
+
+- **Self-hosted runners:** ephemeral (one job per runner), with separate runner groups for dev
+  and prod limited to this repository and workflow, so a token cache or installed package never
+  carries over between jobs.
+- **GitHub-hosted runners with Azure private networking**, if your GitHub plan includes it.
+
+Keep the `validate` job on GitHub-hosted runners: it runs pull request code. The deploy runners
+need outbound access to GitHub, Microsoft Entra ID, `management.azure.com`, PyPI, npm, and the
+Python and Node.js downloads used by the setup actions (or internal mirrors with the tools
+preinstalled). They must resolve the private DNS zones for the gateway
+(`privatelink.azure-api.net`, or an `azure-api.net` zone for an internal virtual network) and the
+vault (`privatelink.vaultcore.azure.net`). Set `APIM_GATEWAY_URL` if they reach the gateway
+through a different hostname. The prod stale-commit check needs Bash with GNU `base64`.
+
+### 8. Schedule key rotation
+
+With Key Vault delivery, keys rotate only when the access step runs within 14 days of a secret's
+expiry. The workflow runs on merges and manual runs only, so add a scheduled workflow (for
+example weekly) that runs `python main.py --env <env> --steps access` with the same environment,
+login, and runner settings as the deploy jobs.
+
+### 9. Monitor
+
+- To collect `llm-emit-token-metric`, connect APIM to Application Insights and enable custom
+  metrics in the API diagnostics (see [Configure token metrics](#5-configure-token-metrics)).
+- In any APIM diagnostic setting, mask the `subscription-key` query parameter, and do not log
+  request or response bodies unless prompts may be stored.
+- Alert on spikes in 401, 403, and 429 responses and on unmanaged-subscription warnings from the
+  access step.
+
+### 10. Roll out
+
+In dev: generate artifacts offline, run a dry run, run the full pipeline, and make a test call
+with a developer key. Then deploy prod with an empty access list, confirm the smoke test passes
+from the production runners, and add grants through reviewed pull requests.
+
 ## Scope and validation
 
 The bundled API exposes **Azure OpenAI chat completions only**. To add other operations,
@@ -385,11 +519,10 @@ as a reference and update both `OPENAPI_SPEC` and `API_POLICY` in
 [onboard_model.py](onboard_model.py). Replacing the specification alone is not sufficient for
 operations with different routes.
 
-The current code was run end to end against a Developer-tier APIM instance and an Azure OpenAI
-`gpt-4o` deployment on 2026-10-30; see [TEST_RESULTS.md](TEST_RESULTS.md) for each action and
-its outcome. Covered: dry runs, publishing, user and subscription creation, the product-scoped
-smoke test, header and query-string keys, deployment restriction, token-limit enforcement,
-adoption of portal-created subscriptions, and suspension, reactivation and cancellation.
+The code was run end to end against a Developer-tier APIM instance and an Azure OpenAI `gpt-4o`
+deployment on 2026-10-30. Covered: dry runs, publishing, user and subscription creation, the
+product-scoped smoke test, deployment restriction, token-limit enforcement, adoption of
+portal-created subscriptions, and suspension, reactivation and cancellation.
 
 The security hardening was then checked on 2026-11-02. Against the same instance: publishing
 with the endpoint allow-list and CLI-only credentials, the smoke test, query-string keys
