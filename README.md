@@ -556,7 +556,16 @@ rejected (400), the `max_tokens` cap (at, over, non-integer, omitted, and null),
 key regeneration, and the unmanaged-subscription warning. With mocks: endpoint, argument, and
 product validation; user state and Entra checks; and Key Vault fingerprinting, expiry, and rotation.
 
-The GitHub workflows (including the prod stale-commit check), developer portal sign-in,
-successful Key Vault delivery and rotation against a real vault, and Application Insights token
-metrics have **not** been validated. Run the workflows in the client's dev environment before
-production use.
+The GitHub workflow was then run end to end on 2026-11-02 from a public repository, with a Basic v2
+APIM instance, a `gpt-5-mini` deployment with key authentication disabled, and a Key Vault reachable
+only through a private endpoint. The deploy jobs ran on a self-hosted runner inside the virtual
+network (`DEPLOY_RUNNER`) with OIDC sign-in. Covered: pull request validation; dev publish, access,
+and smoke test; Key Vault delivery over the private endpoint; the prod approval gate; the
+stale-commit check refusing an approved run whose commit was no longer the latest; a full prod
+deployment; and key rotation (a secret within 14 days of expiry produced a new APIM key, secret
+version, and 90-day expiry). The [consumer function](consumer_function/), on Flex Consumption with
+virtual network integration, read the key through the vault's private IP and received model
+replies before and after rotation without a redeploy.
+
+Developer portal sign-in and Application Insights token metrics have **not** been validated.
+Run the workflow in the client's dev environment before production use.
