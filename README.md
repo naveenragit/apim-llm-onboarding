@@ -62,6 +62,7 @@ Activity 4 (`--steps access`).
 | [grant_access.py](grant_access.py) | Activity 4: APIM users, product subscriptions, optional Key Vault key delivery |
 | [smoke_test.py](smoke_test.py) | Activity 5: one chat completion per model through the gateway |
 | [.github/workflows/deploy.yml](.github/workflows/deploy.yml) | Validates pull requests and deploys merged changes to dev, then prod |
+| [consumer_function/](consumer_function/) | Example Azure Function that reads its key from Key Vault and calls the model through APIM |
 
 Activities 1 and 2 write APIOps artifacts to `build/<env>/apim-artifacts/`. That folder is
 rebuilt by those two steps and is not committed; the publish step uses whatever they last
@@ -156,6 +157,9 @@ Create both GitHub environments and configure these values separately in each:
 | Variable | `ALLOWED_MODEL_ENDPOINTS` | Required. Comma-separated model endpoints this environment may route to, e.g. `https://contoso-aoai-dev.openai.azure.com` |
 | Variable | `ACCESS_KEY_VAULT_URL` | Optional vault URL for storing developer subscription keys |
 | Variable | `APIM_GATEWAY_URL` | Optional gateway base URL for the smoke test, e.g. a private hostname |
+
+Optionally set the **repository** variable `DEPLOY_RUNNER` to the label of a runner that can
+reach private endpoints; the deploy jobs use `ubuntu-latest` when it is not set.
 
 Require pull request reviews on `main` and add required reviewers to the `prod` environment.
 Limit both environments' deployment branches to `main`, so a manual run from another branch
@@ -356,6 +360,22 @@ print(response.choices[0].message.content)
 Use the configured deployment name for `model`. The SDK adds the `/openai` path, so the
 `azure_endpoint` above intentionally omits that suffix. Developers do not need the backend's key.
 
+### From Key Vault
+
+[consumer_function/](consumer_function/) is an Azure Functions (Python) example for keys delivered
+to Key Vault. On each request it reads the secret with its managed identity, calls the model
+through APIM, and returns the reply with diagnostics (the vault's resolved IP, secret version,
+expiry, and key fingerprint), never the key. Because it reads the secret every time, a rotated key
+is picked up without a redeploy. It needs:
+
+- A managed identity with **Key Vault Secrets User** on its own secret, and the client ID in
+  `AZURE_CLIENT_ID` (for a user-assigned identity).
+- Virtual network integration with DNS resolution of the vault's private endpoint.
+- App settings `KEY_VAULT_URL`, `SECRET_NAME` (`apim-llm-<product>--<user-id>`),
+  `APIM_GATEWAY_URL`, `MODEL_NAME`, and `DEPLOYMENT_NAME`.
+
+Call it with `GET https://<app>.azurewebsites.net/api/chat?prompt=Hello` and its function key.
+
 ## Ongoing operations
 
 ### Change or revoke access
@@ -472,9 +492,8 @@ Give it **Key Vault Secrets Officer** only on a vault used for these keys, and g
 ### 7. Run the deploy jobs inside the network
 
 Publishing and access use Azure Resource Manager, which stays public, but the smoke test calls the
-gateway and Key Vault delivery calls the vault, so both need the private network. Change
-`runs-on` for `deploy-dev` and `deploy-prod` in
-[.github/workflows/deploy.yml](.github/workflows/deploy.yml) to runners that can reach it:
+gateway and Key Vault delivery calls the vault, so both need the private network. Set the
+repository variable `DEPLOY_RUNNER` to the label of runners that can reach it:
 
 - **Self-hosted runners:** ephemeral (one job per runner), with separate runner groups for dev
   and prod limited to this repository and workflow, so a token cache or installed package never
