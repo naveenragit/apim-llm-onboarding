@@ -3,4 +3,4 @@
 PyYAML==6.0.3
 azure-identity==1.27.0
 azure-mgmt-apimanagement==5.0.0
-azure-keyvault-secrets==4.11.3
+azure-keyvault-secrets==4.12.0
