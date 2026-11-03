@@ -8,8 +8,8 @@ models:
     description: Azure OpenAI GPT-5 mini chat completions.
     deployment: gpt-5-mini             # Deployment name on the Azure OpenAI / Foundry resource
     endpoints:                         # Model resource endpoint per environment
-      dev: https://aoai-apimops-q4n7.openai.azure.com
-      prod: https://aoai-apimops-q4n7.openai.azure.com
+      dev: https://contoso-openai-dev.openai.azure.com
+      prod: https://contoso-openai-prod.openai.azure.com
 
 # Activity 2: products that bundle models with a token allowance.
 products:
